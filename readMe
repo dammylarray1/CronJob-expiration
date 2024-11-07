@@ -1,0 +1,2 @@
+oc create secret generic quay-api-token --from-literal=token=YOUR_QUAY_API_TOKEN
+# this is to create the secret

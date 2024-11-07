@@ -1,0 +1,20 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: quay-expiration-check
+spec:
+  schedule: "0 0 * * *"  # Runs daily at midnight
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: expiration-check
+            image: your-registry/your-repo:quay-expiration-check
+            env:
+              - name: QUAY_API_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: quay-api-token
+                    key: token
+          restartPolicy: OnFailure
