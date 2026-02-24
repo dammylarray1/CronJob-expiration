@@ -1,0 +1,113 @@
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: build-deploy-with-teams-notify
+  annotations:
+    description: >-
+      Example CI/CD pipeline that builds, tests, deploys, and sends a
+      rich Adaptive Card notification to Microsoft Teams on completion.
+spec:
+  params:
+    - name: git-url
+      type: string
+      description: The Git repository URL
+    - name: git-revision
+      type: string
+      description: The Git revision (branch, tag, or commit SHA)
+      default: "main"
+    - name: image-name
+      type: string
+      description: The container image name to build and push
+    - name: deploy-namespace
+      type: string
+      description: Target namespace for deployment
+      default: "staging"
+
+  workspaces:
+    - name: shared-workspace
+      description: Workspace shared across tasks for source code and build artifacts
+    - name: docker-credentials
+      description: Docker registry credentials
+
+  # ═══════════════════════════════════════════════════════════════
+  # MAIN TASKS — your actual CI/CD pipeline
+  # ═══════════════════════════════════════════════════════════════
+  tasks:
+    - name: clone-repo
+      taskRef:
+        name: git-clone
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.git-revision)
+      workspaces:
+        - name: output
+          workspace: shared-workspace
+
+    - name: run-tests
+      taskRef:
+        name: run-tests  # Replace with your test task
+      runAfter:
+        - clone-repo
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+
+    - name: build-image
+      taskRef:
+        name: kaniko
+      runAfter:
+        - run-tests
+      params:
+        - name: IMAGE
+          value: $(params.image-name)
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+        - name: dockerconfig
+          workspace: docker-credentials
+
+    - name: deploy
+      taskRef:
+        name: kubernetes-actions  # Replace with your deploy task
+      runAfter:
+        - build-image
+      params:
+        - name: script
+          value: |
+            kubectl set image deployment/my-app \
+              my-app=$(params.image-name) \
+              -n $(params.deploy-namespace)
+
+  # ═══════════════════════════════════════════════════════════════
+  # FINALLY BLOCK — always runs, even if main tasks fail
+  # This is where the Teams notification fires.
+  # ═══════════════════════════════════════════════════════════════
+  finally:
+    - name: notify-teams
+      taskRef:
+        name: teams-adaptive-card-notify
+      params:
+        - name: webhook-url-secret
+          value: teams-webhook-secret
+        - name: webhook-url-secret-key
+          value: url
+        - name: pipeline-run-name
+          value: $(context.pipelineRun.name)
+        - name: pipeline-name
+          value: $(context.pipeline.name)
+        - name: namespace
+          value: $(context.pipelineRun.namespace)
+        - name: pipeline-status
+          value: $(tasks.status)
+        - name: dashboard-url
+          value: "https://tekton-dashboard.example.com"  # Replace with your Tekton Dashboard URL
+        - name: cluster-name
+          value: "prod-cluster-us-east-1"                # Replace with your cluster name
+        - name: git-repo
+          value: $(params.git-url)
+        - name: git-branch
+          value: $(params.git-revision)
+        - name: extra-message
+          value: "Image: $(params.image-name) | Target: $(params.deploy-namespace)"
