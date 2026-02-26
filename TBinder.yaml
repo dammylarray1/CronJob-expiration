@@ -1,0 +1,23 @@
+# triggerbinding-pipelinerun-status.yaml
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: pipelinerun-status-binding
+  namespace: tekton-notifications
+spec:
+  params:
+    # Why these JSONPath expressions? Tekton CloudEvents embed PipelineRun
+    # status under the body. The exact paths depend on your Tekton version;
+    # these match the v1 PipelineRun spec (Tekton Pipelines >= 0.50).
+    - name: pipeline-run-name
+      value: $(body.pipelineRun.metadata.name)
+    - name: pipeline-run-status
+      value: $(body.pipelineRun.status.conditions[0].reason)
+    - name: pipeline-run-namespace
+      value: $(body.pipelineRun.metadata.namespace)
+    - name: pipeline-name
+      value: $(body.pipelineRun.metadata.labels['tekton\.dev/pipeline'])
+    - name: start-time
+      value: $(body.pipelineRun.status.startTime)
+    - name: completion-time
+      value: $(body.pipelineRun.status.completionTime)
