@@ -1,0 +1,44 @@
+# pipeline-notify-teams.yaml
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: notify-teams
+  namespace: tekton-notifications
+spec:
+  description: |
+    A standalone notification pipeline. It exists separately from your main
+    pipelines so that notification logic has its own lifecycle, RBAC, and
+    failure domain. If this pipeline fails, your main pipeline's status
+    is unaffected.
+  params:
+    - name: pipeline-run-name
+      type: string
+    - name: pipeline-run-status
+      type: string
+    - name: pipeline-run-namespace
+      type: string
+    - name: pipeline-name
+      type: string
+    - name: start-time
+      type: string
+      default: "unknown"
+    - name: completion-time
+      type: string
+      default: "unknown"
+  tasks:
+    - name: send-notification
+      taskRef:
+        name: teams-notify
+      params:
+        - name: pipeline-run-name
+          value: $(params.pipeline-run-name)
+        - name: pipeline-run-status
+          value: $(params.pipeline-run-status)
+        - name: pipeline-run-namespace
+          value: $(params.pipeline-run-namespace)
+        - name: pipeline-name
+          value: $(params.pipeline-name)
+        - name: start-time
+          value: $(params.start-time)
+        - name: completion-time
+          value: $(params.completion-time)
