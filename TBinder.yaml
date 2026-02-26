@@ -21,3 +21,8 @@ spec:
       value: $(body.pipelineRun.status.startTime)
     - name: completion-time
       value: $(body.pipelineRun.status.completionTime)
+    - name: git-repo-url
+      value: $(body.repository.clone_url)
+    # NEW — this is what links the PipelineRun back to the repo
+    - name: git-repo-name
+      value: $(body.repository.full_name)   # e.g. "sam-org/my-app"
