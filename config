@@ -1,0 +1,348 @@
+# 03-configmap-watcher-script.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notifier-scripts
+  namespace: your-namespace
+data:
+  watch.ps1: |
+    <#
+    .SYNOPSIS
+        Watches PipelineRun completions and sends MS Teams notifications.
+    .DESCRIPTION
+        Uses K8s Watch API (streaming HTTP) — not polling, not cron.
+        Filters on Pipelines-as-Code labels that PAC automatically adds
+        to every PipelineRun it creates.
+        Tracks notified runs in memory to prevent duplicates.
+        Auto-reconnects on timeouts, handles 410 Gone (stale resourceVersion).
+    .NOTES
+        Env vars (set by Deployment):
+        - TEAMS_WEBHOOK_URL  : MS Teams Workflow webhook URL (from Secret)
+        - WATCH_NAMESPACE    : Namespace to watch for PipelineRuns
+        - REQUIRED_LABEL     : PAC label key that must exist on PipelineRun
+        - TARGET_REPO        : (Optional) specific repo name to filter on.
+                               If empty, ALL PAC-created PipelineRuns get notified.
+    #>
+
+    # ── Configuration ──────────────────────────────────────────────
+    $namespace  = $env:WATCH_NAMESPACE
+    $labelKey   = $env:REQUIRED_LABEL
+    $webhookUrl = $env:TEAMS_WEBHOOK_URL
+    $targetRepo = $env:TARGET_REPO     # empty = notify for all PAC repos
+
+    # K8s auto-mounts the SA token here — standard in-cluster auth.
+    $tokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    $apiBase   = "https://kubernetes.default.svc"
+
+    # HashSet for dedup — O(1) lookups, prevents duplicate notifications
+    # when the watch API replays events on reconnect.
+    $notified = [System.Collections.Generic.HashSet[string]]::new()
+
+    # ── Adaptive Card Sender ───────────────────────────────────────
+    function Send-TeamsNotification {
+        param(
+            [Parameter(Mandatory)][string]$Name,
+            [Parameter(Mandatory)][string]$Status,
+            [Parameter(Mandatory)][string]$Namespace,
+            [Parameter(Mandatory)][string]$PipelineName,
+            [Parameter(Mandatory)][string]$RepoName,
+            [string]$RepoUrl = "",
+            [string]$Branch = "",
+            [string]$EventType = "",
+            [string]$StartTime = "unknown",
+            [string]$CompletionTime = "unknown"
+        )
+
+        # Colour-coded containers for instant visual scanning in Teams.
+        # "good" = green, "attention" = red in Adaptive Card theme.
+        if ($Status -eq "Succeeded") {
+            $emoji = "✅"; $accent = "good"; $text = "Succeeded"
+        } else {
+            $emoji = "❌"; $accent = "attention"; $text = "Failed"
+        }
+
+        # Build the facts list dynamically — only include fields that
+        # have values. PAC always sets these, but this is defensive.
+        $facts = @(
+            @{ title = "Repository";  value = $RepoName }
+        )
+        if ($RepoUrl)   { $facts += @{ title = "Repo URL";    value = $RepoUrl } }
+        if ($Branch)     { $facts += @{ title = "Branch";      value = $Branch } }
+        if ($EventType)  { $facts += @{ title = "Event";       value = $EventType } }
+        $facts += @(
+            @{ title = "Pipeline";    value = $PipelineName }
+            @{ title = "PipelineRun"; value = $Name }
+            @{ title = "Namespace";   value = $Namespace }
+            @{ title = "Status";      value = "$emoji $text" }
+            @{ title = "Started";     value = $StartTime }
+            @{ title = "Completed";   value = $CompletionTime }
+        )
+
+        # Teams Workflow webhooks require the Adaptive Card wrapped in a
+        # "message" envelope with "attachments". Sending just the card
+        # returns 202 but never renders. Legacy MessageCard format is
+        # deprecated — only Adaptive Card schema works with Workflows.
+        $card = @{
+            type = "message"
+            attachments = @(
+                @{
+                    contentType = "application/vnd.microsoft.card.adaptive"
+                    content = @{
+                        '$schema' = "http://adaptivecards.io/schemas/adaptive-card.json"
+                        type      = "AdaptiveCard"
+                        version   = "1.4"
+                        body      = @(
+                            @{
+                                type  = "Container"
+                                style = $accent
+                                bleed = $true
+                                items = @(
+                                    @{
+                                        type   = "TextBlock"
+                                        text   = "$emoji Pipeline Run $text"
+                                        weight = "Bolder"
+                                        size   = "Large"
+                                        color  = if ($Status -eq "Succeeded") { "Good" } else { "Attention" }
+                                    }
+                                )
+                            },
+                            @{
+                                type  = "FactSet"
+                                facts = $facts
+                            },
+                            @{
+                                type     = "TextBlock"
+                                text     = "Notification sent at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC' -AsUTC)"
+                                isSubtle = $true
+                                size     = "Small"
+                                wrap     = $true
+                            }
+                        )
+                    }
+                }
+            )
+        }
+
+        # -Depth 20 because the card is nested 6+ levels deep. PowerShell's
+        # default depth of 2 silently truncates, producing invalid JSON that
+        # Teams rejects with a cryptic 400 error.
+        $jsonPayload = $card | ConvertTo-Json -Depth 20 -Compress
+
+        try {
+            $response = Invoke-RestMethod `
+                -Uri $webhookUrl `
+                -Method Post `
+                -ContentType "application/json" `
+                -Body $jsonPayload `
+                -ErrorAction Stop
+
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ✅ Notified: $Name ($RepoName) [$text]"
+        }
+        catch {
+            # Detailed error logging because Teams webhook errors are vague.
+            # The payload is printed so you can paste it into
+            # https://adaptivecards.io/designer/ to debug the card visually.
+            Write-Error "[$(Get-Date -Format 'HH:mm:ss')] ❌ Failed: $Name — $($_.Exception.Message)"
+            Write-Error "Status Code: $($_.Exception.Response.StatusCode.value__)"
+            Write-Host "--- Payload for debugging ---"
+            Write-Host $jsonPayload
+            # Don't exit — a failed notification shouldn't crash the watcher.
+        }
+    }
+
+    # ── Event Processor ────────────────────────────────────────────
+    function Process-PipelineRunEvent {
+        param([Parameter(Mandatory)]$Event)
+
+        $pr     = $Event.object
+        $name   = $pr.metadata.name
+        $labels = $pr.metadata.labels
+
+        # GUARD 1: Does it have the PAC label?
+        # PAC adds "pipelinesascode.tekton.dev/repository" to every
+        # PipelineRun it creates. Runs without this label (manual runs
+        # via `tkn pipeline start`, other controllers, etc.) are ignored.
+        if (-not $labels -or -not $labels.$labelKey) { return }
+
+        # GUARD 2: Does it match the target repo (if one is configured)?
+        # If TARGET_REPO is set, only notify for that specific repo.
+        # If TARGET_REPO is empty, notify for ALL PAC-created runs.
+        $repoName = $labels.$labelKey
+        if ($targetRepo -and $repoName -ne $targetRepo) { return }
+
+        # GUARD 3: Is it in a terminal state?
+        # PipelineRuns go through Started → Running → Succeeded/Failed.
+        # The watch API fires MODIFIED for each transition. We only
+        # want the final state.
+        $conditions = $pr.status.conditions
+        if (-not $conditions -or $conditions.Count -eq 0) { return }
+        $reason = $conditions[0].reason
+        if ($reason -ne "Succeeded" -and $reason -ne "Failed") { return }
+
+        # GUARD 4: Have we already notified for this PipelineRun?
+        # Watch API can replay events on reconnect or when metadata
+        # is updated after reaching terminal state (finalizers, etc.).
+        if ($notified.Contains($name)) { return }
+        $notified.Add($name) | Out-Null
+
+        # GUARD 5: Prevent unbounded memory growth.
+        # 1000 is a reasonable ceiling — oldest entries are for runs
+        # that finished hours/days ago and are safe to forget.
+        if ($notified.Count -gt 1000) {
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Pruning dedup cache..."
+            $notified.Clear()
+            $notified.Add($name) | Out-Null
+        }
+
+        # Extract metadata from PAC labels — all of these are set
+        # automatically by PAC, so no custom labeling is needed.
+        $pipelineName = if ($labels.'tekton.dev/pipeline') {
+            $labels.'tekton.dev/pipeline'
+        } else { "unknown" }
+
+        $repoUrl   = if ($labels.'pipelinesascode.tekton.dev/url-repository') {
+            $labels.'pipelinesascode.tekton.dev/url-repository'
+        } else { "" }
+
+        $branch    = if ($labels.'pipelinesascode.tekton.dev/branch') {
+            $labels.'pipelinesascode.tekton.dev/branch'
+        } else { "" }
+
+        $eventType = if ($labels.'pipelinesascode.tekton.dev/event-type') {
+            $labels.'pipelinesascode.tekton.dev/event-type'
+        } else { "" }
+
+        Send-TeamsNotification `
+            -Name           $name `
+            -Status         $reason `
+            -Namespace      $pr.metadata.namespace `
+            -PipelineName   $pipelineName `
+            -RepoName       $repoName `
+            -RepoUrl        $repoUrl `
+            -Branch         $branch `
+            -EventType      $eventType `
+            -StartTime      "$($pr.status.startTime)" `
+            -CompletionTime "$($pr.status.completionTime)"
+    }
+
+    # ── Main Watch Loop ────────────────────────────────────────────
+
+    Write-Host "═══════════════════════════════════════════════════"
+    Write-Host " Pipeline Notifier — Watcher Mode (PAC)"
+    Write-Host " Namespace:    $namespace"
+    Write-Host " Label filter: $labelKey"
+    if ($targetRepo) {
+        Write-Host " Target repo:  $targetRepo"
+    } else {
+        Write-Host " Target repo:  (all PAC repos)"
+    }
+    Write-Host " Started at:   $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC' -AsUTC)"
+    Write-Host "═══════════════════════════════════════════════════"
+
+    # HttpClient instead of Invoke-WebRequest because the K8s watch API
+    # is a long-lived streaming connection. Invoke-WebRequest buffers the
+    # entire response and would block forever. HttpClient with
+    # GetStreamAsync lets us read events line-by-line as they arrive.
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.ServerCertificateCustomValidationCallback = {
+        param($message, $cert, $chain, $errors)
+        # In-cluster TLS uses the cluster CA, not in the system trust store.
+        # For production hardening, validate against the CA at
+        # /var/run/secrets/kubernetes.io/serviceaccount/ca.crt instead.
+        return $true
+    }
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    # Infinite timeout because the watch connection stays open for up to
+    # 300s. HttpClient's default 100s timeout would kill it prematurely.
+    $client.Timeout = [System.Threading.Timeout]::InfiniteTimeSpan
+
+    $resourceVersion = ""
+
+    while ($true) {
+        try {
+            # Step A: Get current resourceVersion via a list call.
+            # Starting a watch without one replays ALL existing PipelineRuns.
+            # limit=1 minimizes response size — we only need the resourceVersion.
+            if (-not $resourceVersion) {
+                # Re-read token each cycle — K8s rotates projected SA tokens
+                # periodically (default: 1 hour).
+                $token = (Get-Content $tokenPath -Raw).Trim()
+                $client.DefaultRequestHeaders.Authorization =
+                    [System.Net.Http.Headers.AuthenticationHeaderValue]::new("Bearer", $token)
+
+                $listUrl  = "$apiBase/apis/tekton.dev/v1/namespaces/$namespace/pipelineruns?limit=1"
+                $listResp = $client.GetStringAsync($listUrl).Result | ConvertFrom-Json
+                $resourceVersion = $listResp.metadata.resourceVersion
+                Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Starting watch from resourceVersion: $resourceVersion"
+            }
+
+            # Step B: Open the watch stream.
+            # timeoutSeconds=300 gives a predictable 5-minute reconnect cadence.
+            # Without it, network proxies or load balancers may silently drop
+            # idle connections at unpredictable times.
+            $watchUrl = "$apiBase/apis/tekton.dev/v1/namespaces/$namespace/pipelineruns" +
+                        "?watch=true&resourceVersion=$resourceVersion&timeoutSeconds=300"
+
+            $stream = $client.GetStreamAsync($watchUrl).Result
+            $reader = [System.IO.StreamReader]::new($stream)
+
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Watch stream connected. Waiting for events..."
+
+            # Step C: Read events line by line (NDJSON — one JSON object per line).
+            # ReadLine() blocks until data arrives — zero CPU while idle.
+            while (-not $reader.EndOfStream) {
+                $line = $reader.ReadLine()
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+
+                try {
+                    $event = $line | ConvertFrom-Json
+
+                    # Update resourceVersion on every event so reconnects
+                    # pick up exactly where we left off — no missed events.
+                    if ($event.object.metadata.resourceVersion) {
+                        $resourceVersion = $event.object.metadata.resourceVersion
+                    }
+
+                    # Only MODIFIED events — that's when status changes.
+                    # ADDED = created (no status yet).
+                    # DELETED = garbage collected (already done).
+                    if ($event.type -eq "MODIFIED") {
+                        Process-PipelineRunEvent -Event $event
+                    }
+
+                    # BOOKMARK events update resourceVersion without a real change
+                    # (keepalive mechanism from the API server).
+                    if ($event.type -eq "BOOKMARK") {
+                        $resourceVersion = $event.object.metadata.resourceVersion
+                    }
+                }
+                catch {
+                    # Per-event catch — malformed event shouldn't crash the watcher.
+                    Write-Warning "[$(Get-Date -Format 'HH:mm:ss')] Failed to process event: $($_.Exception.Message)"
+                }
+            }
+
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Watch stream ended (timeout). Reconnecting..."
+
+        }
+        catch {
+            Write-Warning "[$(Get-Date -Format 'HH:mm:ss')] Watch error: $($_.Exception.Message)"
+
+            # 410 Gone = resourceVersion too old, etcd compacted past it.
+            # Re-list to get a fresh one. All other errors are transient.
+            if ($_.Exception.Message -match "410|Gone") {
+                Write-Host "[$(Get-Date -Format 'HH:mm:ss')] resourceVersion expired. Re-listing..."
+                $resourceVersion = ""
+            }
+
+            # 5s backoff prevents tight-loop reconnection that could flood
+            # the API server or fill logs.
+            Start-Sleep -Seconds 5
+        }
+        finally {
+            # Explicit disposal prevents file descriptor leaks across reconnects.
+            # PowerShell doesn't aggressively GC .NET I/O handles.
+            if ($reader) { try { $reader.Dispose() } catch {} }
+            if ($stream) { try { $stream.Dispose() } catch {} }
+        }
+    }
