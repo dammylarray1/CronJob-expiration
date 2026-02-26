@@ -1,0 +1,31 @@
+# eventlistener-pipelinerun-status.yaml
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: pipelinerun-status-listener
+  namespace: tekton-notifications
+spec:
+  serviceAccountName: tekton-notifications-sa
+  triggers:
+    - name: on-pipelinerun-complete
+      # Why interceptors? They act as a filter BEFORE the TriggerBinding runs.
+      # Without a CEL filter, every PipelineRun event (started, running, etc.)
+      # would spawn a notification — flooding your Teams channel.
+      interceptors:
+        - ref:
+            name: "cel"
+          params:
+            - name: "filter"
+              value: >
+                body.pipelineRun.status.conditions[0].status == 'True' &&
+                body.pipelineRun.status.conditions[0].reason == 'Succeeded'
+                ||
+                body.pipelineRun.status.conditions[0].status == 'False' &&
+                body.pipelineRun.status.conditions[0].reason == 'Failed'
+            # Why this specific CEL expression? PipelineRuns go through many
+            # condition states (Started, Running, etc.). We only want terminal
+            # states: Succeeded or Failed.
+      bindings:
+        - ref: pipelinerun-status-binding
+      template:
+        ref: teams-notify-template
