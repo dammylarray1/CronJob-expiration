@@ -1,0 +1,40 @@
+# triggertemplate-teams-notify.yaml
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: teams-notify-template
+  namespace: tekton-notifications
+spec:
+  params:
+    - name: pipeline-run-name
+    - name: pipeline-run-status
+    - name: pipeline-run-namespace
+    - name: pipeline-name
+    - name: start-time
+      default: "unknown"
+    - name: completion-time
+      default: "unknown"
+  resourcetemplates:
+    - apiVersion: tekton.dev/v1
+      kind: PipelineRun
+      metadata:
+        # Why generateName? Each notification is its own PipelineRun object.
+        # This gives you full audit trail in `tkn pipelinerun list`.
+        generateName: notify-teams-run-
+        namespace: tekton-notifications
+      spec:
+        pipelineRef:
+          name: notify-teams
+        params:
+          - name: pipeline-run-name
+            value: $(tt.params.pipeline-run-name)
+          - name: pipeline-run-status
+            value: $(tt.params.pipeline-run-status)
+          - name: pipeline-run-namespace
+            value: $(tt.params.pipeline-run-namespace)
+          - name: pipeline-name
+            value: $(tt.params.pipeline-name)
+          - name: start-time
+            value: $(tt.params.start-time)
+          - name: completion-time
+            value: $(tt.params.completion-time)
