@@ -1,0 +1,70 @@
+# 04-deployment-notifier.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pipeline-notifier
+  namespace: your-namespace
+  labels:
+    app: pipeline-notifier
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: pipeline-notifier
+  template:
+    metadata:
+      labels:
+        app: pipeline-notifier
+    spec:
+      serviceAccountName: pipeline
+      containers:
+        - name: notifier
+          image: mcr.microsoft.com/powershell:lts-ubi9
+          command: ["pwsh", "-File", "/scripts/watch.ps1"]
+          env:
+            - name: TEAMS_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: teams-webhook-secret
+                  key: webhook-url
+            - name: WATCH_NAMESPACE
+              value: "your-namespace"
+            # PAC automatically adds this label to every PipelineRun.
+            # The watcher uses it to identify PAC-created runs and
+            # extract the repo name. No custom labeling needed.
+            - name: REQUIRED_LABEL
+              value: "pipelinesascode.tekton.dev/repository"
+            # TARGET_REPO scopes notifications to one specific repo.
+            # Set to the repo name as it appears in the PAC label
+            # (run: kubectl get pipelinerun <name> -o jsonpath='{.metadata.labels.pipelinesascode\.tekton\.dev/repository}')
+            # Leave empty to notify for ALL PAC repos in the namespace.
+            - name: TARGET_REPO
+              value: "my-app"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          livenessProbe:
+            exec:
+              command:
+                - pwsh
+                - -Command
+                - "Get-Process pwsh | Out-Null"
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            failureThreshold: 3
+            timeoutSeconds: 5
+      volumes:
+        - name: scripts
+          configMap:
+            name: notifier-scripts
+      restartPolicy: Always
