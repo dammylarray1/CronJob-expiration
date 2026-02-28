@@ -1,79 +1,238 @@
-# task-extract-payload.yaml
 apiVersion: tekton.dev/v1beta1
 kind: Task
 metadata:
-  name: extract-pipelinerun-payload
-  namespace: tekton-pipelines
+  name: teams-adaptive-card-notify
+  labels:
+    app.kubernetes.io/version: "0.2"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/categories: Messaging
+    tekton.dev/tags: messaging, microsoft-teams
+    tekton.dev/displayName: "Send Adaptive Card to Microsoft Teams"
 spec:
-  description: >
-    Extracts PipelineRun event data and builds a structured JSON
-    payload for downstream notification tasks.
+  description: >-
+    Sends a richly formatted Adaptive Card notification to a Microsoft Teams
+    channel via an Incoming Webhook. Supports pipeline run metadata including
+    status, duration, task breakdown, and direct links to the Tekton dashboard.
   params:
+    - name: webhook-url-secret
+      type: string
+      description: Name of the Kubernetes secret containing the Teams webhook URL
+    - name: webhook-url-secret-key
+      type: string
+      description: Key within the secret that holds the webhook URL
+      default: "url"
+    - name: pipeline-run-name
+      type: string
+      description: Name of the PipelineRun (use $(context.pipelineRun.name))
     - name: pipeline-name
       type: string
-      description: Name of the pipeline that triggered the event
-    - name: pipelinerun-name
-      type: string
-      description: Name of the PipelineRun
-    - name: status
-      type: string
-      description: Current status (Started, Succeeded, Failed, etc.)
+      description: Name of the Pipeline (use $(context.pipeline.name))
     - name: namespace
       type: string
+      description: Namespace where the PipelineRun executed
       default: "default"
-  results:
-    - name: notification-payload
-      description: JSON payload ready to send to Power Automate
-    - name: status-emoji
-      description: Emoji indicator for the status (for message formatting)
+    - name: pipeline-status
+      type: string
+      description: >-
+        Aggregated status of all tasks. Use $(tasks.status) which resolves to
+        Succeeded, Failed, or Completed (mixed results).
+    - name: dashboard-url
+      type: string
+      description: Base URL of the Tekton Dashboard (e.g., https://tekton.example.com)
+      default: ""
+    - name: cluster-name
+      type: string
+      description: Friendly name for the cluster
+      default: "kubernetes-cluster"
+    - name: git-repo
+      type: string
+      description: Git repository URL (optional, for context)
+      default: ""
+    - name: git-branch
+      type: string
+      description: Git branch (optional, for context)
+      default: ""
+    - name: git-commit
+      type: string
+      description: Git commit SHA (optional, for context)
+      default: ""
+    - name: extra-message
+      type: string
+      description: Any additional message to include in the card
+      default: ""
   steps:
-    - name: build-payload
-      image: mcr.microsoft.com/powershell:7.4-alpine-3.17
+    - name: send-adaptive-card
+      image: mcr.microsoft.com/powershell:lts-ubi9  # PowerShell on UBI9 base
+      env:
+        - name: WEBHOOK_URL
+          valueFrom:
+            secretKeyRef:
+              name: $(params.webhook-url-secret)
+              key: $(params.webhook-url-secret-key)
       script: |
         #!/usr/bin/env pwsh
-        Set-StrictMode -Version Latest
-        $ErrorActionPreference = 'Stop'
+        $ErrorActionPreference = "Stop"
 
-        $pipelineName    = "$(params.pipeline-name)"
-        $pipelineRunName = "$(params.pipelinerun-name)"
-        $status          = "$(params.status)"
-        $namespace       = "$(params.namespace)"
+        # --- Determine status icon and color ---
+        $Status = "$(params.pipeline-status)".Trim()
 
-        # Map status to emoji and human-readable label.
-        # Why here and not in the sender? Because formatting decisions
-        # are part of payload shaping — the sender should just deliver.
-        $statusMap = @{
-            'Started'   = @{ emoji = '🚀'; label = 'Started' }
-            'Running'   = @{ emoji = '⏳'; label = 'Running' }
-            'Succeeded' = @{ emoji = '✅'; label = 'Succeeded' }
-            'Completed' = @{ emoji = '✅'; label = 'Completed' }
-            'Failed'    = @{ emoji = '❌'; label = 'Failed' }
+        switch ($Status) {
+            { $_ -in @("Succeeded", "succeeded", "Completed", "completed", "True", "true") } {
+                $StatusIcon  = "✅"
+                $StatusColor = "Good"
+                $StatusText  = "Succeeded"
+            }
+            { $_ -in @("Failed", "failed", "False", "false") } {
+                $StatusIcon  = "❌"
+                $StatusColor = "Attention"
+                $StatusText  = "Failed"
+            }
+            default {
+                $StatusIcon  = "⚠️"
+                $StatusColor = "Warning"
+                $StatusText  = "Completed (with issues)"
+            }
         }
 
-        $mapped = $statusMap[$status]
-        if (-not $mapped) {
-            # Fallback for unexpected statuses — don't break, just flag
-            $mapped = @{ emoji = 'ℹ️'; label = $status }
+        # --- Build dashboard link ---
+        $DashboardUrl = "$(params.dashboard-url)"
+        $Namespace    = "$(params.namespace)"
+        $PipelineRun  = "$(params.pipeline-run-name)"
+        $RunLink      = ""
+
+        if ($DashboardUrl) {
+            $RunLink = "${DashboardUrl}/#/namespaces/${Namespace}/pipelineruns/${PipelineRun}"
         }
 
-        # Build the payload Power Automate expects
-        $payload = @{
-            pipelineName    = $pipelineName
-            pipelineRunName = $pipelineRunName
-            status          = $mapped.label
-            statusEmoji     = $mapped.emoji
-            namespace       = $namespace
-            timestamp       = (Get-Date -Format 'o')
-            summary         = "$($mapped.emoji) Pipeline '$pipelineName' - $($mapped.label)"
-        } | ConvertTo-Json -Depth 3 -Compress
+        # --- Build git info facts ---
+        $GitRepo   = "$(params.git-repo)"
+        $GitBranch = "$(params.git-branch)"
+        $GitCommit = "$(params.git-commit)"
 
-        Write-Host "Built payload for $pipelineRunName [$status]"
-        Write-Host "Payload: $payload"
+        $GitFacts = @()
+        if ($GitRepo) {
+            $GitFacts += @{ title = "Repository"; value = $GitRepo }
+        }
+        if ($GitBranch) {
+            $GitFacts += @{ title = "Branch"; value = $GitBranch }
+        }
+        if ($GitCommit) {
+            $ShortCommit = $GitCommit.Substring(0, [Math]::Min(8, $GitCommit.Length))
+            $GitFacts += @{ title = "Commit"; value = $ShortCommit }
+        }
 
-        # Write outputs to Tekton Results.
-        # Why -NoNewline? Tekton Results are read as raw strings —
-        # a trailing newline would corrupt JSON parsing downstream.
-        $payload | Out-File -FilePath $(results.notification-payload.path) -NoNewline
-        $mapped.emoji | Out-File -FilePath $(results.status-emoji.path) -NoNewline
+        # --- Build core facts ---
+        $Facts = @(
+            @{ title = "PipelineRun"; value = $PipelineRun }
+            @{ title = "Namespace";   value = $Namespace }
+            @{ title = "Cluster";     value = "$(params.cluster-name)" }
+            @{ title = "Status";      value = $StatusText }
+        )
+        $Facts += $GitFacts
 
-        Write-Host "Payload written to results successfully."
+        # --- Build card body ---
+        $Body = @(
+            @{
+                type    = "ColumnSet"
+                columns = @(
+                    @{
+                        type                     = "Column"
+                        width                    = "auto"
+                        verticalContentAlignment = "Center"
+                        items                    = @(
+                            @{ type = "TextBlock"; text = $StatusIcon; size = "Large" }
+                        )
+                    }
+                    @{
+                        type  = "Column"
+                        width = "stretch"
+                        items = @(
+                            @{
+                                type   = "TextBlock"
+                                text   = "Tekton Pipeline: ${StatusText}"
+                                weight = "Bolder"
+                                size   = "Medium"
+                                color  = $StatusColor
+                                wrap   = $true
+                            }
+                            @{
+                                type     = "TextBlock"
+                                text     = "$(params.pipeline-name)"
+                                spacing  = "None"
+                                isSubtle = $true
+                                wrap     = $true
+                            }
+                        )
+                    }
+                )
+            }
+            @{
+                type  = "FactSet"
+                facts = $Facts
+            }
+        )
+
+        # --- Add extra message block if provided ---
+        $ExtraMsg = "$(params.extra-message)"
+        if ($ExtraMsg) {
+            $Body += @{
+                type    = "TextBlock"
+                text    = $ExtraMsg
+                wrap    = $true
+                spacing = "Medium"
+            }
+        }
+
+        # --- Add dashboard button if URL provided ---
+        if ($RunLink) {
+            $Body += @{
+                type    = "ActionSet"
+                actions = @(
+                    @{
+                        type  = "Action.OpenUrl"
+                        title = "View PipelineRun in Dashboard"
+                        url   = $RunLink
+                        style = "positive"
+                    }
+                )
+            }
+        }
+
+        # --- Compose the Adaptive Card payload ---
+        $Payload = @{
+            type        = "message"
+            attachments = @(
+                @{
+                    contentType = "application/vnd.microsoft.card.adaptive"
+                    contentUrl  = $null
+                    content     = @{
+                        '$schema' = "http://adaptivecards.io/schemas/adaptive-card.json"
+                        type      = "AdaptiveCard"
+                        version   = "1.4"
+                        body      = $Body
+                    }
+                }
+            )
+        } | ConvertTo-Json -Depth 20 -Compress
+
+        # --- Send to Teams ---
+        Write-Host "Sending notification to Microsoft Teams..."
+
+        try {
+            $Response = Invoke-RestMethod `
+                -Uri $env:WEBHOOK_URL `
+                -Method Post `
+                -ContentType "application/json" `
+                -Body $Payload `
+                -StatusCodeVariable "StatusCode"
+
+            Write-Host "Response code: $StatusCode"
+            Write-Host "Teams notification sent successfully."
+        }
+        catch {
+            $ErrStatus = $_.Exception.Response.StatusCode.value__
+            Write-Host "ERROR: Failed to send Teams notification (HTTP ${ErrStatus})"
+            Write-Host $_.Exception.Message
+            exit 1
+        }
